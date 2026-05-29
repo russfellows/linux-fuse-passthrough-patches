@@ -1,0 +1,173 @@
+From f9f9517f85deaf6595f5a44e76e6648cd3fc10c7 Mon Sep 17 00:00:00 2001
+From: Russ Fellows <russ.fellows@gmail.com>
+Date: Thu, 29 May 2026 00:00:00 +0000
+Subject: [PATCH 1/2] fuse: fix FOPEN_PARALLEL_DIRECT_WRITES being ignored for
+ passthrough writes
+
+FOPEN_PARALLEL_DIRECT_WRITES has no effect on passthrough-backed FUSE
+files due to two independent bugs that each prevent it from working.
+Both must be fixed to restore parallel write concurrency.
+
+Bug 1: fuse_passthrough_write_iter() acquires the exclusive inode lock
+directly:
+
+    inode_lock(inode);
+    ret = backing_file_write_iter(...);
+    inode_unlock(inode);
+
+This serializes all concurrent writers regardless of whether the server
+set FOPEN_PARALLEL_DIRECT_WRITES.  The flag is checked by
+fuse_dio_wr_exclusive_lock(), called from fuse_dio_lock(), called from
+fuse_direct_write_iter() -- the non-passthrough O_DIRECT path.
+fuse_file_write_iter() routes passthrough opens to
+fuse_passthrough_write_iter() instead, bypassing the flag check entirely.
+
+Bug 2: fuse_file_io_open() in iomode.c strips FOPEN_PARALLEL_DIRECT_WRITES
+from any open that lacks FOPEN_DIRECT_IO:
+
+    if (!(ff->open_flags & FOPEN_DIRECT_IO))
+        ff->open_flags &= ~FOPEN_PARALLEL_DIRECT_WRITES;
+
+This is correct for regular direct-IO opens where FOPEN_DIRECT_IO ensures
+O_DIRECT is actually in effect.  It is wrong for passthrough opens: a
+passthrough file already bypasses the FUSE page cache by definition, so
+FOPEN_DIRECT_IO is redundant and should not be required to preserve the
+parallel-writes flag.
+
+Note: adding FOPEN_DIRECT_IO to the daemon's open flags is not a valid
+workaround.  fuse_file_write_iter() checks FOPEN_DIRECT_IO before
+FOPEN_PASSTHROUGH, so setting both causes writes to be routed through
+fuse_direct_write_iter() (requiring a userspace round-trip) instead of
+fuse_passthrough_write_iter() (zero-copy kernel path).
+
+Combined effect: a daemon that opens with FOPEN_PASSTHROUGH |
+FOPEN_PARALLEL_DIRECT_WRITES (without FOPEN_DIRECT_IO) has the parallel
+flag stripped by Bug 2 before Bug 1 is even reached.  Both bugs must be
+fixed together.
+
+Fix Bug 1: make fuse_dio_lock() and fuse_dio_unlock() non-static and call
+them from fuse_passthrough_write_iter(), replacing the open-coded
+inode_lock/inode_unlock.  This reuses the existing logic that handles
+FOPEN_PARALLEL_DIRECT_WRITES, append writes, writes past EOF, and
+page-cache IO mode transitions.
+
+Fix Bug 2: skip the FOPEN_PARALLEL_DIRECT_WRITES strip when
+FOPEN_PASSTHROUGH is set.  The flag remains stripped for non-passthrough
+opens without FOPEN_DIRECT_IO, preserving existing behaviour.
+
+Safety: backing_file_write_iter() calls into the backing filesystem's
+write_iter (e.g. xfs_file_write_iter), which acquires the backing inode's
+own lock independently.  The FUSE inode lock and the backing inode lock are
+entirely separate; using inode_lock_shared on the FUSE inode does not
+affect the backing filesystem's concurrency control.
+
+Fixes: 4d99ff8f6b85 ("fuse: implement open/create with FOPEN_PASSTHROUGH")
+Cc: stable@vger.kernel.org
+Signed-off-by: Russ Fellows <russ.fellows@gmail.com>
+---
+ fs/fuse/file.c        |  6 +++---
+ fs/fuse/fuse_i.h      |  2 ++
+ fs/fuse/iomode.c      |  8 ++++++--
+ fs/fuse/passthrough.c |  6 +++---
+ 4 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index f94f3dc082c6..602c3f18676e 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -1428,8 +1428,8 @@ static bool fuse_dio_wr_exclusive_lock(struct kiocb *iocb, struct iov_iter *from
+ 	return false;
+ }
+ 
+-static void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from,
+-			  bool *exclusive)
++void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from,
++		   bool *exclusive)
+ {
+ 	struct inode *inode = file_inode(iocb->ki_filp);
+ 	struct fuse_inode *fi = get_fuse_inode(inode);
+@@ -1455,7 +1455,7 @@ static void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from,
+ 	}
+ }
+ 
+-static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive)
++void fuse_dio_unlock(struct kiocb *iocb, bool exclusive)
+ {
+ 	struct inode *inode = file_inode(iocb->ki_filp);
+ 	struct fuse_inode *fi = get_fuse_inode(inode);
+@@ -1469,7 +1469,7 @@ static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive)
+ 	}
+ }
+ 
+-static const struct iomap_write_ops fuse_iomap_write_ops = {
++static const struct iomap_write_ops fuse_iomap_write_ops = {	/* unchanged */
+ 	.read_folio_range = fuse_iomap_read_folio_range,
+ };
+ 
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 17423d4e3cfa..120de517cea0 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -1541,6 +1541,8 @@ int fuse_file_io_open(struct file *file, struct inode *inode);
+ void fuse_file_io_release(struct fuse_file *ff, struct inode *inode);
+ 
+ /* file.c */
++void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from, bool *exclusive);
++void fuse_dio_unlock(struct kiocb *iocb, bool exclusive);
+ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
+ 				 unsigned int open_flags, bool isdir);
+ void fuse_file_release(struct inode *inode, struct fuse_file *ff,
+diff --git a/fs/fuse/iomode.c b/fs/fuse/iomode.c
+index c99e285f3..b3f51e3d1 100644
+--- a/fs/fuse/iomode.c
++++ b/fs/fuse/iomode.c
+@@ -214,10 +214,14 @@ int fuse_file_io_open(struct file *file, struct inode *inode)
+ 	if (fuse_inode_backing(fi) && !(ff->open_flags & FOPEN_PASSTHROUGH))
+ 		goto fail;
+ 
+-	/*
+-	 * FOPEN_PARALLEL_DIRECT_WRITES requires FOPEN_DIRECT_IO.
+-	 */
+-	if (!(ff->open_flags & FOPEN_DIRECT_IO))
++	/*
++	 * FOPEN_PARALLEL_DIRECT_WRITES requires FOPEN_DIRECT_IO, except for
++	 * passthrough opens which bypass the page cache regardless and do not
++	 * need FOPEN_DIRECT_IO to guarantee direct I/O semantics.
++	 */
++	if (!(ff->open_flags & FOPEN_DIRECT_IO) &&
++	    !(ff->open_flags & FOPEN_PASSTHROUGH))
+ 		ff->open_flags &= ~FOPEN_PARALLEL_DIRECT_WRITES;
+ 
+ 	/*
+diff --git a/fs/fuse/passthrough.c b/fs/fuse/passthrough.c
+index f2d08ac2459b..f83d0a27cfb9 100644
+--- a/fs/fuse/passthrough.c
++++ b/fs/fuse/passthrough.c
+@@ -54,11 +54,11 @@ ssize_t fuse_passthrough_write_iter(struct kiocb *iocb,
+ 				    struct iov_iter *iter)
+ {
+ 	struct file *file = iocb->ki_filp;
+-	struct inode *inode = file_inode(file);
+ 	struct fuse_file *ff = file->private_data;
+ 	struct file *backing_file = fuse_file_passthrough(ff);
+ 	size_t count = iov_iter_count(iter);
+ 	ssize_t ret;
++	bool exclusive;
+ 	struct backing_file_ctx ctx = {
+ 		.cred = ff->cred,
+ 		.end_write = fuse_passthrough_end_write,
+@@ -70,10 +70,10 @@ ssize_t fuse_passthrough_write_iter(struct kiocb *iocb,
+ 	if (!count)
+ 		return 0;
+ 
+-	inode_lock(inode);
++	fuse_dio_lock(iocb, iter, &exclusive);
+ 	ret = backing_file_write_iter(backing_file, iter, iocb, iocb->ki_flags,
+ 				      &ctx);
+-	inode_unlock(inode);
++	fuse_dio_unlock(iocb, exclusive);
+ 
+ 	return ret;
+ }
+-- 
+2.51.0
