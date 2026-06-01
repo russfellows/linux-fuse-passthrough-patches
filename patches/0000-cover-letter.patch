@@ -1,47 +1,43 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Russ Fellows <russ.fellows@gmail.com>
-Date: Thu, 29 May 2026 00:00:00 +0000
-Subject: [PATCH 0/2] fuse: fix and optimize parallel writes on passthrough mounts
+From: Russ Fellows <rfellows@xlrait.dev>
+Date: Mon, 1 Jun 2026 21:57:12 +0000
+Subject: [PATCH 0/2] fuse: fix passthrough parallel direct writes with a minimal series
 
-These two patches fix a bug that causes FOPEN_PARALLEL_DIRECT_WRITES to have
-no effect on FUSE passthrough mounts, preventing write IOPS from scaling with
-concurrency.
+This series contains the current minimal submit-ready fix for passthrough write
+parallelism.
 
-The bug has two sides that must be fixed together (patch 1/2):
+The first patch preserves FOPEN_PARALLEL_DIRECT_WRITES for passthrough opens.
+Without that, fuse_file_io_open() strips the flag before passthrough writes see
+it, so the kernel never reaches the shared-lock path.
 
-  (a) fuse_passthrough_write_iter() calls inode_lock() directly, bypassing
-      the fuse_dio_lock() function that checks FOPEN_PARALLEL_DIRECT_WRITES.
+The second patch keeps the lock decision local to passthrough.c and allows
+shared inode locking only for safe direct overwrite writes. Append writes,
+buffered writes, and writes that may extend EOF remain serialized.
 
-  (b) fuse_file_io_open() strips FOPEN_PARALLEL_DIRECT_WRITES from any open
-      that lacks FOPEN_DIRECT_IO, including passthrough opens where the flag
-      is redundant and should not be required.
+This intentionally replaces the older broader patch direction. The current
+minimal series does not export fuse_dio_lock()/fuse_dio_unlock() from file.c,
+does not add declarations to fuse_i.h, and does not include the separate
+iocachectr/fi->lock cleanup work.
 
-Either bug alone is sufficient to serialize all writers.  Together they ensure
-the flag can never take effect on a passthrough-backed file.
+Validated on kernel 6.17.13-p4min with fio 4K random direct writes on a FUSE
+passthrough mount backed by XFS on a RAM-backed null_blk device:
 
-Patch 2/2 is an independent performance follow-on: once parallel writes are
-unblocked, the per-inode spinlock (fi->lock) becomes the next measurable cost.
-This patch converts iocachectr to atomic_t and adds lockless fast paths to
-fuse_inode_uncached_io_start/end and fuse_write_update_attr.
+  numjobs | FUSE IOPS
+  --------|----------
+        1 |   481,837
+        2 |   931,883
+        4 | 1,533,058
+        8 | 1,730,477
 
-Tested with fio randwrite 4K direct, numjobs=1/2/4/8, iodepth=64, on a FUSE
-passthrough mount backed by XFS on a RAM-backed null_blk device (kernel 6.17.13,
-AMD EPYC 9B45, 16 threads):
-
-  numjobs | Before (IOPS) | After patch 1 | After patch 2
-  --------|---------------|---------------|---------------
-        1 |        ~470K  |        ~470K  |        ~470K
-        2 |        ~650K  |        ~930K  |        ~930K
-        4 |        ~640K  |      ~1,530K  |      ~1,530K
-        8 |        ~635K  |      ~1,707K  |      ~1,707K
-
-Raw XFS throughput on the same device at numjobs=8: ~1,702K IOPS.
+Raw XFS on the same device at numjobs=8: 1,693,406 IOPS.
 
 Russ Fellows (2):
-  fuse: fix FOPEN_PARALLEL_DIRECT_WRITES being ignored for passthrough writes
-  fuse: reduce fi->lock contention on parallel direct I/O
+  fuse: preserve FOPEN_PARALLEL_DIRECT_WRITES for passthrough opens
+  fuse: allow parallel direct writes in passthrough write_iter
 
- fs5 files changed, 104 insertions(+), 25 deletions(-)
+ fs/fuse/iomode.c      |  7 +++++--
+ fs/fuse/passthrough.c | 46 ++++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 49 insertions(+), 4 deletions(-)
 
 -- 
 2.51.0
