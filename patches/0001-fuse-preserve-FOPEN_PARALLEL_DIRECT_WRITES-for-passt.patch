@@ -1,40 +1,92 @@
-From 7aa5e715991002edaa4eac7416902e4823b0487d Mon Sep 17 00:00:00 2001
-From: Russ Fellows <rfellows@xlrait.ai>
-Date: Mon, 1 Jun 2026 21:52:53 +0000
-Subject: [PATCH v2 1/2] fuse: preserve FOPEN_PARALLEL_DIRECT_WRITES for
+From beb75c3a44b5ccddf65778fd9a971f89d7fd5685 Mon Sep 17 00:00:00 2001
+From: Russ Fellows <russ.fellows@gmail.com>
+Date: Tue, 16 Jun 2026 22:12:50 +0000
+Subject: [PATCH v3 1/2] fuse: preserve FOPEN_PARALLEL_DIRECT_WRITES for
  passthrough opens
 
-fuse_file_io_open() currently strips FOPEN_PARALLEL_DIRECT_WRITES whenever FOPEN_DIRECT_IO is absent. That rule is correct for the regular direct-IO path, but it is too strict for passthrough opens.
+fuse_file_io_open() clears FOPEN_PARALLEL_DIRECT_WRITES for any open
+that lacks FOPEN_DIRECT_IO.  That rule is too strict for passthrough
+opens, which already bypass the page cache through the backing file
+and do not need FOPEN_DIRECT_IO to guarantee direct-I/O semantics.
+Clearing the flag before the passthrough write path sees it prevents
+the kernel from ever taking the shared-lock path for passthrough writes.
 
-Passthrough I/O already bypasses the page cache through the backing file, so it does not need FOPEN_DIRECT_IO to preserve direct-I/O semantics. Clearing the parallel-write flag for passthrough opens causes the kernel to drop the server's request for parallel direct writes before the passthrough write path ever sees it.
+Introduce FOPEN_IOMODE helper macros to classify the effective I/O mode
+of an open file:
 
-Keep FOPEN_PARALLEL_DIRECT_WRITES for opens that also carry FOPEN_PASSTHROUGH, and continue to clear it for non-passthrough opens that lack FOPEN_DIRECT_IO.
+  FOPEN_IOMODE_IS_CACHED(oflags)      - page-cache I/O (neither flag)
+  FOPEN_IOMODE_IS_DIRECT(oflags)      - DIRECT_IO is set
+  FOPEN_IOMODE_IS_PASSTHROUGH(oflags) - PASSTHROUGH only (no DIRECT_IO)
 
-This is a prerequisite for passthrough write parallelism: without it, the subsequent shared-lock path never activates.
+Use FOPEN_IOMODE_IS_CACHED to express the PARALLEL_DIRECT_WRITES guard
+cleanly: the flag is only suppressed for cached iomode, not for passthrough
+or direct-IO mode.
 
-Signed-off-by: Russ Fellows <rfellows@xlrait.ai>
+This is a prerequisite for passthrough write parallelism; without it the
+shared-lock path in the subsequent patch never activates.
+
+Signed-off-by: Russ Fellows <russ.fellows@gmail.com>
 ---
- fs/fuse/iomode.c | 7 +++++--
- 1 file changed, 5 insertions(+), 2 deletions(-)
+ fs/fuse/iomode.c | 30 +++++++++++++++++++++++++++---
+ 1 file changed, 27 insertions(+), 3 deletions(-)
 
 diff --git a/fs/fuse/iomode.c b/fs/fuse/iomode.c
-index c99e285f3..0301a48d8 100644
+index c99e285f3..46e60b04c 100644
 --- a/fs/fuse/iomode.c
 +++ b/fs/fuse/iomode.c
-@@ -216,9 +216,12 @@ int fuse_file_io_open(struct file *file, struct inode *inode)
-		goto fail;
+@@ -165,6 +165,23 @@ static void fuse_file_uncached_io_release(struct fuse_file *ff,
+ 	(FOPEN_PASSTHROUGH | FOPEN_DIRECT_IO | FOPEN_PARALLEL_DIRECT_WRITES | \
+ 	 FOPEN_NOFLUSH)
  
-	/*
++/*
++ * Helpers to classify the effective I/O mode of an open file.
++ *
++ * FOPEN_IOMODE()         - extract the mode-relevant bits
++ * FOPEN_IOMODE_IS_CACHED - neither DIRECT_IO nor PASSTHROUGH: page-cache I/O
++ * FOPEN_IOMODE_IS_DIRECT - DIRECT_IO is set (may also have PASSTHROUGH)
++ * FOPEN_IOMODE_IS_PASSTHROUGH - PASSTHROUGH only, without DIRECT_IO
++ */
++#define FOPEN_IOMODE(oflags) \
++	((oflags) & (FOPEN_DIRECT_IO | FOPEN_PASSTHROUGH))
++#define FOPEN_IOMODE_IS_CACHED(oflags) \
++	(FOPEN_IOMODE(oflags) == 0)
++#define FOPEN_IOMODE_IS_DIRECT(oflags) \
++	(FOPEN_IOMODE(oflags) & FOPEN_DIRECT_IO)
++#define FOPEN_IOMODE_IS_PASSTHROUGH(oflags) \
++	(FOPEN_IOMODE(oflags) == FOPEN_PASSTHROUGH)
++
+ static int fuse_file_passthrough_open(struct inode *inode, struct file *file)
+ {
+ 	struct fuse_file *ff = file->private_data;
+@@ -216,9 +233,11 @@ int fuse_file_io_open(struct file *file, struct inode *inode)
+ 		goto fail;
+ 
+ 	/*
 -	 * FOPEN_PARALLEL_DIRECT_WRITES requires FOPEN_DIRECT_IO.
-+	 * FOPEN_PARALLEL_DIRECT_WRITES requires FOPEN_DIRECT_IO, except for
-+	 * passthrough opens which bypass the page cache regardless and do not
-+	 * need FOPEN_DIRECT_IO to guarantee direct I/O semantics.
-	 */
++	 * FOPEN_PARALLEL_DIRECT_WRITES is not supported with cached iomode.
++	 * Passthrough and direct-IO both bypass the page cache, so both are
++	 * eligible to enable parallel direct writes.
+ 	 */
 -	if (!(ff->open_flags & FOPEN_DIRECT_IO))
-+	if (!(ff->open_flags & FOPEN_DIRECT_IO) &&
-+	    !(ff->open_flags & FOPEN_PASSTHROUGH))
-		ff->open_flags &= ~FOPEN_PARALLEL_DIRECT_WRITES;
++	if (FOPEN_IOMODE_IS_CACHED(ff->open_flags))
+ 		ff->open_flags &= ~FOPEN_PARALLEL_DIRECT_WRITES;
  
-	/*
+ 	/*
+@@ -228,8 +247,13 @@ int fuse_file_io_open(struct file *file, struct inode *inode)
+ 	 * Note that if user opens a file open with O_DIRECT, but server did
+ 	 * not specify FOPEN_DIRECT_IO, a later fcntl() could remove O_DIRECT,
+ 	 * so we put the inode in caching mode to prevent parallel dio.
++	 *
++	 * Pure direct-IO (DIRECT_IO without PASSTHROUGH) needs no page-cache
++	 * iomode machinery — return early.  When DIRECT_IO and PASSTHROUGH are
++	 * both set, write_iter uses the direct-IO path but the backing file
++	 * still needs to be opened below.
+ 	 */
+-	if ((ff->open_flags & FOPEN_DIRECT_IO) &&
++	if (FOPEN_IOMODE_IS_DIRECT(ff->open_flags) &&
+ 	    !(ff->open_flags & FOPEN_PASSTHROUGH))
+ 		return 0;
+ 
 -- 
 2.51.0
+

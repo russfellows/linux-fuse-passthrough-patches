@@ -1,33 +1,88 @@
-From 13338b96272c050b5e4801e8f8c596aa182f4099 Mon Sep 17 00:00:00 2001
-From: Russ Fellows <rfellows@xlrait.ai>
-Date: Mon, 1 Jun 2026 21:52:53 +0000
-Subject: [PATCH v2 2/2] fuse: allow parallel direct writes in passthrough
+From 1f3ed18c04a59b62519b8205739db55a9d6d0ee8 Mon Sep 17 00:00:00 2001
+From: Russ Fellows <russ.fellows@gmail.com>
+Date: Tue, 16 Jun 2026 22:13:03 +0000
+Subject: [PATCH v3 2/2] fuse: allow parallel direct writes in passthrough
  write_iter
 
-fuse_passthrough_write_iter() currently relies on the generic fuse_dio_lock() path to decide whether writes may run under a shared inode lock. That couples passthrough to the regular direct-IO helpers and does not make the passthrough-specific safety conditions explicit.
+fuse_passthrough_write_iter() unconditionally called fuse_dio_lock()
+from file.c, which required those helpers to be exported.  That coupling
+is unnecessary and the exported symbols are undesirable.
 
-Keep the decision local to passthrough.c instead. Allow shared inode locking only when all of the following are true:
+Replace the fuse_dio_lock()/fuse_dio_unlock() calls with a
+passthrough-specific pair, fuse_passthrough_lock() and
+fuse_passthrough_unlock(), that is self-contained in passthrough.c.
 
-- the open carries FOPEN_PARALLEL_DIRECT_WRITES
-- the write is direct I/O
-- the write is not append
-- the write does not extend past EOF
+The new fuse_passthrough_lock() allows shared inode locking only when
+all of the following are true:
 
-Buffered writes, append writes, and EOF-extending writes remain serialized under the exclusive inode lock.
+  - the open carries FOPEN_PARALLEL_DIRECT_WRITES
+  - the write is direct I/O (IOCB_DIRECT)
+  - the write is not append (IOCB_APPEND absent)
+  - the write does not extend past EOF
 
-This preserves the parallel direct-write win for safe overwrite I/O without exporting extra helper APIs from file.c.
+The past-EOF check is made once before the lock is taken (fast path
+to choose lock type), and then re-checked after taking the shared lock.
+This re-check closes the TOCTOU window: a concurrent writer could extend
+EOF between the initial check and the lock acquisition; without the
+re-check a shared-lock writer could concurrently update i_size.
 
-Signed-off-by: Russ Fellows <rfellows@xlrait.ai>
+Passthrough files are always in uncached iomode (established at open
+time via fuse_file_uncached_io_open()), so the fuse_inode_uncached_io_start()
+guard from fuse_dio_lock() is not needed here.
+
+Restore fuse_dio_lock() and fuse_dio_unlock() to file-private (static).
+Remove their declarations from fuse_i.h.
+
+Signed-off-by: Russ Fellows <russ.fellows@gmail.com>
 ---
- fs/fuse/passthrough.c | 46 +++++++++++++++++++++++++++++++++++++++++--
- 1 file changed, 44 insertions(+), 2 deletions(-)
+ fs/fuse/file.c        |  6 ++--
+ fs/fuse/fuse_i.h      |  2 --
+ fs/fuse/passthrough.c | 74 +++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 75 insertions(+), 7 deletions(-)
 
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index 7cba331d0..f8651a195 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -1366,8 +1366,8 @@ static bool fuse_dio_wr_exclusive_lock(struct kiocb *iocb, struct iov_iter *from
+ 	return false;
+ }
+ 
+-void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from,
+-		   bool *exclusive)
++static void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from,
++			  bool *exclusive)
+ {
+ 	struct inode *inode = file_inode(iocb->ki_filp);
+ 	struct fuse_inode *fi = get_fuse_inode(inode);
+@@ -1393,7 +1393,7 @@ void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from,
+ 	}
+ }
+ 
+-void fuse_dio_unlock(struct kiocb *iocb, bool exclusive)
++static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive)
+ {
+ 	struct inode *inode = file_inode(iocb->ki_filp);
+ 	struct fuse_inode *fi = get_fuse_inode(inode);
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 8d05c7c52..cc428d04b 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -1507,8 +1507,6 @@ int fuse_file_io_open(struct file *file, struct inode *inode);
+ void fuse_file_io_release(struct fuse_file *ff, struct inode *inode);
+ 
+ /* file.c */
+-void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from, bool *exclusive);
+-void fuse_dio_unlock(struct kiocb *iocb, bool exclusive);
+ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
+ 				 unsigned int open_flags, bool isdir);
+ void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 diff --git a/fs/fuse/passthrough.c b/fs/fuse/passthrough.c
-index ee822a983..c32b35a6d 100644
+index ee822a983..11c16de4d 100644
 --- a/fs/fuse/passthrough.c
 +++ b/fs/fuse/passthrough.c
-@@ -25,6 +25,38 @@ static void fuse_passthrough_end_write(struct kiocb *iocb, ssize_t ret)
-	fuse_write_update_attr(inode, iocb->ki_pos, ret);
+@@ -25,6 +25,76 @@ static void fuse_passthrough_end_write(struct kiocb *iocb, ssize_t ret)
+ 	fuse_write_update_attr(inode, iocb->ki_pos, ret);
  }
  
 +static bool fuse_passthrough_io_past_eof(struct kiocb *iocb,
@@ -38,20 +93,22 @@ index ee822a983..c32b35a6d 100644
 +	return iocb->ki_pos + iov_iter_count(iter) > i_size_read(inode);
 +}
 +
-+static bool fuse_passthrough_write_exclusive(struct kiocb *iocb,
-+					     struct iov_iter *iter)
++/*
++ * Decide whether an exclusive inode lock is required for a passthrough write
++ * before the lock is taken.  Returns true (exclusive needed) unless all of:
++ *   - server advertised FOPEN_PARALLEL_DIRECT_WRITES
++ *   - write is direct I/O (not buffered)
++ *   - write is not append
++ *   - write does not appear to extend past EOF (re-checked after lock below)
++ */
++static bool fuse_passthrough_write_needs_exclusive(struct kiocb *iocb,
++						   struct iov_iter *iter)
 +{
-+	struct file *file = iocb->ki_filp;
-+	struct fuse_file *ff = file->private_data;
++	struct fuse_file *ff = iocb->ki_filp->private_data;
 +
 +	if (!(ff->open_flags & FOPEN_PARALLEL_DIRECT_WRITES))
 +		return true;
 +
-+	/*
-+	 * Passthrough writes do not use the regular FUSE direct-IO iomode path.
-+	 * Allow shared locking only for direct overwrite I/O; buffered writes,
-+	 * append writes, and writes that may extend EOF remain serialized.
-+	 */
 +	if (!(iocb->ki_flags & IOCB_DIRECT))
 +		return true;
 +	if (iocb->ki_flags & IOCB_APPEND)
@@ -62,38 +119,58 @@ index ee822a983..c32b35a6d 100644
 +	return false;
 +}
 +
- ssize_t fuse_passthrough_read_iter(struct kiocb *iocb, struct iov_iter *iter)
- {
-	struct file *file = iocb->ki_filp;
-@@ -54,6 +86,7 @@ ssize_t fuse_passthrough_write_iter(struct kiocb *iocb,
-				    struct iov_iter *iter)
- {
-	struct file *file = iocb->ki_filp;
-+	struct inode *inode = file_inode(file);
-	struct fuse_file *ff = file->private_data;
-	struct file *backing_file = fuse_file_passthrough(ff);
-	size_t count = iov_iter_count(iter);
-@@ -70,10 +103,19 @@ ssize_t fuse_passthrough_write_iter(struct kiocb *iocb,
-	if (!count)
-		return 0;
- 
--	fuse_dio_lock(iocb, iter, &exclusive);
-+	exclusive = fuse_passthrough_write_exclusive(iocb, iter);
-+	if (exclusive)
-+		inode_lock(inode);
-+	else
-+		inode_lock_shared(inode);
++static void fuse_passthrough_lock(struct kiocb *iocb, struct iov_iter *iter,
++				  bool *exclusive)
++{
++	struct inode *inode = file_inode(iocb->ki_filp);
 +
-	ret = backing_file_write_iter(backing_file, iter, iocb, iocb->ki_flags,
-				     &ctx);
--	fuse_dio_unlock(iocb, exclusive);
++	*exclusive = fuse_passthrough_write_needs_exclusive(iocb, iter);
++	if (*exclusive) {
++		inode_lock(inode);
++	} else {
++		inode_lock_shared(inode);
++		/*
++		 * The past-EOF check in fuse_passthrough_write_needs_exclusive()
++		 * was made without holding the inode lock and may have raced
++		 * with a concurrent EOF-extending write.  Re-check under the
++		 * shared lock and upgrade to exclusive if the write now reaches
++		 * past EOF, to ensure i_size is never updated without exclusive
++		 * serialisation.
++		 */
++		if (fuse_passthrough_io_past_eof(iocb, iter)) {
++			inode_unlock_shared(inode);
++			inode_lock(inode);
++			*exclusive = true;
++		}
++	}
++}
++
++static void fuse_passthrough_unlock(struct kiocb *iocb, bool exclusive)
++{
++	struct inode *inode = file_inode(iocb->ki_filp);
 +
 +	if (exclusive)
 +		inode_unlock(inode);
 +	else
 +		inode_unlock_shared(inode);
++}
++
+ ssize_t fuse_passthrough_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+ {
+ 	struct file *file = iocb->ki_filp;
+@@ -70,10 +140,10 @@ ssize_t fuse_passthrough_write_iter(struct kiocb *iocb,
+ 	if (!count)
+ 		return 0;
  
-	return ret;
+-	fuse_dio_lock(iocb, iter, &exclusive);
++	fuse_passthrough_lock(iocb, iter, &exclusive);
+ 	ret = backing_file_write_iter(backing_file, iter, iocb, iocb->ki_flags,
+ 				      &ctx);
+-	fuse_dio_unlock(iocb, exclusive);
++	fuse_passthrough_unlock(iocb, exclusive);
+ 
+ 	return ret;
  }
 -- 
 2.51.0
+
