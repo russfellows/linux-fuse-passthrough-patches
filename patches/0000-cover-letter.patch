@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Russ Fellows <rfellows@xlrait.dev>
+From: Russ Fellows <rfellows@xlrait.ai>
 Date: Mon, 1 Jun 2026 21:57:12 +0000
 Subject: [PATCH v2 0/2] fuse: fix passthrough parallel direct writes with a minimal series
 

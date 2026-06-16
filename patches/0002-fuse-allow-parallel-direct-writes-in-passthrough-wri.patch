@@ -1,5 +1,5 @@
 From 13338b96272c050b5e4801e8f8c596aa182f4099 Mon Sep 17 00:00:00 2001
-From: Russ Fellows <rfellows@xlrait.dev>
+From: Russ Fellows <rfellows@xlrait.ai>
 Date: Mon, 1 Jun 2026 21:52:53 +0000
 Subject: [PATCH v2 2/2] fuse: allow parallel direct writes in passthrough
  write_iter
@@ -17,7 +17,7 @@ Buffered writes, append writes, and EOF-extending writes remain serialized under
 
 This preserves the parallel direct-write win for safe overwrite I/O without exporting extra helper APIs from file.c.
 
-Signed-off-by: Russ Fellows <rfellows@xlrait.dev>
+Signed-off-by: Russ Fellows <rfellows@xlrait.ai>
 ---
  fs/fuse/passthrough.c | 46 +++++++++++++++++++++++++++++++++++++++++--
  1 file changed, 44 insertions(+), 2 deletions(-)

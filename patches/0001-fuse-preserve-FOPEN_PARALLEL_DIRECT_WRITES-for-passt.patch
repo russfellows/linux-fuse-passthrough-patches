@@ -1,5 +1,5 @@
 From 7aa5e715991002edaa4eac7416902e4823b0487d Mon Sep 17 00:00:00 2001
-From: Russ Fellows <rfellows@xlrait.dev>
+From: Russ Fellows <rfellows@xlrait.ai>
 Date: Mon, 1 Jun 2026 21:52:53 +0000
 Subject: [PATCH v2 1/2] fuse: preserve FOPEN_PARALLEL_DIRECT_WRITES for
  passthrough opens
@@ -12,7 +12,7 @@ Keep FOPEN_PARALLEL_DIRECT_WRITES for opens that also carry FOPEN_PASSTHROUGH, a
 
 This is a prerequisite for passthrough write parallelism: without it, the subsequent shared-lock path never activates.
 
-Signed-off-by: Russ Fellows <rfellows@xlrait.dev>
+Signed-off-by: Russ Fellows <rfellows@xlrait.ai>
 ---
  fs/fuse/iomode.c | 7 +++++--
  1 file changed, 5 insertions(+), 2 deletions(-)
