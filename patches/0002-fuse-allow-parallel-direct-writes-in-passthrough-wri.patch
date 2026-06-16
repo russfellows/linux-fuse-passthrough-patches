@@ -1,7 +1,7 @@
 From 13338b96272c050b5e4801e8f8c596aa182f4099 Mon Sep 17 00:00:00 2001
 From: Russ Fellows <rfellows@xlrait.dev>
 Date: Mon, 1 Jun 2026 21:52:53 +0000
-Subject: [PATCH 2/2] fuse: allow parallel direct writes in passthrough
+Subject: [PATCH v2 2/2] fuse: allow parallel direct writes in passthrough
  write_iter
 
 fuse_passthrough_write_iter() currently relies on the generic fuse_dio_lock() path to decide whether writes may run under a shared inode lock. That couples passthrough to the regular direct-IO helpers and does not make the passthrough-specific safety conditions explicit.

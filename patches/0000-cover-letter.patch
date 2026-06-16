@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Russ Fellows <rfellows@xlrait.dev>
 Date: Mon, 1 Jun 2026 21:57:12 +0000
-Subject: [PATCH 0/2] fuse: fix passthrough parallel direct writes with a minimal series
+Subject: [PATCH v2 0/2] fuse: fix passthrough parallel direct writes with a minimal series
 
 This series contains the current minimal submit-ready fix for passthrough write
 parallelism.
@@ -19,6 +19,12 @@ minimal series does not export fuse_dio_lock()/fuse_dio_unlock() from file.c,
 does not add declarations to fuse_i.h, and does not include the separate
 iocachectr/fi->lock cleanup work.
 
+Regarding fuse_passthrough_end_write() safety: the shared lock is only taken
+for within-EOF direct overwrites, where i_size does not change. In that case
+fuse_passthrough_end_write() -> fuse_write_update_attr() only updates mtime/
+ctime, which is safe under a shared inode lock. Past-EOF writes still take
+the exclusive lock, so i_size updates are always serialized correctly.
+
 Validated on kernel 6.17.13-p4min with fio 4K random direct writes on a FUSE
 passthrough mount backed by XFS on a RAM-backed null_blk device:
 
@@ -30,6 +36,19 @@ passthrough mount backed by XFS on a RAM-backed null_blk device:
         8 | 1,730,477
 
 Raw XFS on the same device at numjobs=8: 1,693,406 IOPS.
+
+Changes since v1:
+  - Removed use of fuse_dio_lock()/fuse_dio_unlock() from file.c; the lock
+    decision is now self-contained in passthrough.c using inode_lock_shared()
+    and inode_unlock_shared() directly.
+  - Added explicit IOCB_DIRECT check: parallel locking is only allowed for
+    direct I/O, preventing accidental shared locking on buffered writes.
+  - Added explicit IOCB_APPEND check: append writes always serialize.
+  - Added explicit past-EOF check: writes that extend i_size always serialize.
+  - Removed all symbol exports from file.c (fuse_dio_lock, fuse_dio_unlock).
+  - Removed all declarations added to fuse_i.h.
+  - Split into two patches: iomode.c flag preservation as a prerequisite
+    (patch 1) and passthrough.c locking logic as the main change (patch 2).
 
 Russ Fellows (2):
   fuse: preserve FOPEN_PARALLEL_DIRECT_WRITES for passthrough opens
